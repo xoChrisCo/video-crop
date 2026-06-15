@@ -1,20 +1,20 @@
 # video-crop
 
-Interactive video cropper: pick a frame, drag a rectangle, get a cropped video.
+Interactive video cropper: pick a frame, drag a rectangle, get a cropped video. Also stitches videos end-to-end.
 
-A tiny Python CLI that opens a still frame from your video, lets you draw and adjust a crop rectangle with the mouse, then crops the entire video to that region using `ffmpeg`. Audio is preserved.
+A tiny Python CLI that opens a still frame from your video, lets you draw and adjust a crop rectangle with the mouse, then crops the entire video to that region using `ffmpeg`. Audio is preserved by default.
 
 ## How it works
 
-1. Extracts one frame from the video (middle by default, or at a timestamp you pass).
+1. Extracts one frame from the video (middle by default, or wherever you point it).
 2. Opens an OpenCV window so you can drag out a rectangle and fine-tune it.
-3. Calls `ffmpeg` with a `crop` filter to produce `<name>_cropped.<ext>` next to the original.
+3. Calls `ffmpeg` with a `crop` filter (and any trim/encode flags) to produce `<name>_cropped.<ext>` next to the original.
 
 ## Requirements
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) — for environment & dependency management
-- `ffmpeg` available on your `PATH`
+- `ffmpeg` on your `PATH`
   - macOS: `brew install ffmpeg`
   - Debian/Ubuntu: `sudo apt install ffmpeg`
   - Windows: [ffmpeg.org/download](https://ffmpeg.org/download.html)
@@ -22,7 +22,7 @@ A tiny Python CLI that opens a still frame from your video, lets you draw and ad
 ## Install
 
 ```sh
-git clone https://github.com/<you>/video-crop.git
+git clone https://github.com/xoChrisCo/video-crop.git
 cd video-crop
 uv sync
 ```
@@ -30,13 +30,10 @@ uv sync
 ## Usage
 
 ```sh
-uv run python crop.py <video_path> [seconds]
+uv run python crop.py <video> [flags]
+uv run python crop.py --stitch <list-or-dir> [flags]
+uv run python crop.py --help
 ```
-
-| Argument        | Description                                                                  |
-| --------------- | ---------------------------------------------------------------------------- |
-| `<video_path>`  | Path to the input video.                                                     |
-| `[seconds]`     | Optional. Timestamp of the frame to draw on. Defaults to the middle frame.   |
 
 ### Drawing the crop
 
@@ -45,31 +42,108 @@ A window opens showing the chosen frame:
 - **Drag on empty space** to draw a rectangle.
 - **Drag a corner or edge** to resize.
 - **Drag inside the rectangle** to move it.
-- **Enter** to submit and start cropping.
-- **Esc** to abort.
+- **Enter** to submit, **Esc** to abort.
 
 ### Output
 
-The cropped file is written next to the input with a `_cropped` suffix:
+Default output is written next to the input with a suffix:
 
 ```
 clip.mp4  →  clip_cropped.mp4
+first.mp4 → first_stitched.mp4   (when using --stitch)
 ```
 
-Video is re-encoded with `ffmpeg`'s defaults (typically libx264). Audio is copied as-is.
+Override with `-o/--output PATH` or change the suffix with `--suffix STR`.
 
-## Example
+## Flags
+
+### Frame selection (mutually exclusive)
+| Flag | Description |
+| ---- | ----------- |
+| `-t, --time SECONDS` | Timestamp of the preview frame. |
+| `--frame N` | Preview by frame index. |
+| `--percent P` | Preview at P% of the duration (0–100). |
+
+Default: middle of the video.
+
+### Output
+| Flag | Description |
+| ---- | ----------- |
+| `-o, --output PATH` | Explicit output path. |
+| `--suffix STR` | Suffix when `-o` isn't given. Default: `_cropped` (or `_stitched` for stitch). |
+| `--overwrite / --no-overwrite` | Pass `-y` or `-n` to ffmpeg. Default: overwrite. |
+
+### Crop shape
+| Flag | Description |
+| ---- | ----------- |
+| `--rect x:y:w:h` | Skip the UI; crop to these pixel coords. |
+| `--aspect W:H` | Constrain the UI rectangle to this aspect ratio. |
+| `--square` | Shortcut for `--aspect 1:1`. |
+| `--padding PX` | Expand the chosen rectangle by N pixels each side. |
+| `--snap N` | Round final crop coords to multiples of N. |
+
+### Encoding
+| Flag | Description |
+| ---- | ----------- |
+| `--codec NAME` | Video codec (e.g. `libx265`). |
+| `--crf N` | Quality (lower = better). |
+| `--preset NAME` | ffmpeg preset (e.g. `fast`, `slow`). |
+| `--copy-video` | Stream-copy video. Usually fails with a crop filter — escape hatch only. |
+| `--no-audio` | Drop the audio track. |
+| `--reencode-audio` | Re-encode audio with ffmpeg defaults instead of copying. |
+
+### Trim
+| Flag | Description |
+| ---- | ----------- |
+| `--start SECONDS` | Trim start of output. |
+| `--end SECONDS` | Trim end (absolute time). Mutually exclusive with `--duration`. |
+| `--duration SECONDS` | Limit output length. |
+
+### Stitch
+| Flag | Description |
+| ---- | ----------- |
+| `--stitch LIST_OR_DIR` | Concat videos end-to-end. Comma-separated paths in order, or a directory (joined alphabetically). Output is `<first>_stitched.<ext>`. Uses `-c copy`, so inputs must share codec/params — re-encode them to a common format first if ffmpeg complains. |
+
+### UI / behavior
+| Flag | Description |
+| ---- | ----------- |
+| `--no-ui` | Require `--rect`; don't open a window. |
+| `--show-grid` | Overlay rule-of-thirds inside the rectangle. |
+| `--scale FACTOR` | Scale the preview window (e.g. `0.5` for 4K sources). Clicks map back to full resolution. |
+| `--dry-run` | Print the ffmpeg command and exit. |
+| `-v, --verbose` | Show full ffmpeg output. |
+| `--ffmpeg PATH` | Override the ffmpeg binary. |
+| `-h, --help` | Show help. |
+
+## Examples
 
 ```sh
-uv run python crop.py clip.mp4 5
-# Opens the frame at 5s. Drag a rectangle, press Enter.
-# → clip_cropped.mp4
+# Default: middle frame, draw freely
+uv run python crop.py clip.mp4
+
+# Pick the frame at 5s
+uv run python crop.py clip.mp4 -t 5
+
+# Headless crop to exact coords
+uv run python crop.py clip.mp4 --rect 100:50:640:360 --no-ui
+
+# 16:9-locked crop with rule-of-thirds overlay
+uv run python crop.py clip.mp4 --aspect 16:9 --show-grid
+
+# Crop, trim from 2s for 3s, drop audio, smaller file
+uv run python crop.py clip.mp4 --start 2 --duration 3 --no-audio --crf 28 --preset fast
+
+# Stitch a folder of clips in alphabetical order
+uv run python crop.py --stitch ./clips/
+
+# Stitch specific files in order
+uv run python crop.py --stitch intro.mp4,part1.mp4,outro.mp4 -o final.mp4
 ```
 
 ## Notes
 
 - Crop dimensions are rounded down to even numbers so common encoders (H.264) accept them.
-- If the bounding box has zero area, the script aborts without writing a file.
+- Stitching uses `ffmpeg -f concat -c copy` (no re-encode). If inputs have different codecs, resolutions, or framerates, ffmpeg will refuse — normalize them first.
 - Tested on macOS. Should work anywhere OpenCV's GUI and `ffmpeg` work.
 
 ## License
