@@ -37,6 +37,31 @@ def parse_aspect(s: str) -> float:
     return w / h
 
 
+def parse_every(s: str) -> float | None:
+    if s.strip().lower() == "all":
+        return None
+    try:
+        v = float(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a number of seconds or 'all'")
+    if v <= 0:
+        raise argparse.ArgumentTypeError("interval must be > 0")
+    return v
+
+
+def parse_size(s: str) -> tuple[int, int]:
+    parts = s.lower().replace("x", ":").split(":")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("expected WxH")
+    try:
+        w, h = (int(p) for p in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError("W and H must be integers")
+    if w <= 0 or h <= 0:
+        raise argparse.ArgumentTypeError("W and H must be > 0")
+    return w, h
+
+
 def get_frame(video_path: Path, seconds: float | None, frame_index: int | None, percent: float | None):
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -341,10 +366,69 @@ def build_stitch_cmd(args, inputs: list[Path], list_file: Path, out_path: Path) 
     return cmd
 
 
+def probe_signature(ffprobe: str, path: Path):
+    """Return (codec, width, height, time_base) for the first video stream, or None."""
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name,width,height,time_base",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return None
+    line = out.stdout.strip().splitlines()
+    if not line:
+        return None
+    return tuple(line[0].split(","))
+
+
+def inputs_are_uniform(ffprobe: str, inputs: list[Path]) -> bool:
+    sigs = [probe_signature(ffprobe, f) for f in inputs]
+    if any(s is None for s in sigs):
+        return False  # couldn't probe; be safe and re-encode
+    return len(set(sigs)) == 1
+
+
+def build_stitch_filter_cmd(args, inputs: list[Path], out_path: Path) -> list[str]:
+    """Re-encode + normalize via the concat filter (handles mismatched size/fps/codec)."""
+    cmd = [args.ffmpeg]
+    cmd.append("-y" if args.overwrite else "-n")
+    if not args.verbose:
+        cmd += ["-loglevel", "error", "-stats"]
+    for f in inputs:
+        cmd += ["-i", str(f)]
+
+    n = len(inputs)
+    fps = args.fps
+    w, h = args.stitch_size
+    parts = []
+    for i in range(n):
+        parts.append(
+            f"[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}[v{i}];"
+        )
+        parts.append(f"[{i}:a]aresample=async=1:first_pts=0[a{i}];")
+    streams = "".join(f"[v{i}][a{i}]" for i in range(n))
+    filtergraph = "".join(parts) + f"{streams}concat=n={n}:v=1:a=1[outv][outa]"
+
+    cmd += ["-filter_complex", filtergraph, "-map", "[outv]", "-map", "[outa]"]
+    if args.codec:
+        cmd += ["-c:v", args.codec]
+    if args.crf is not None:
+        cmd += ["-crf", str(args.crf)]
+    if args.preset:
+        cmd += ["-preset", args.preset]
+    cmd.append(str(out_path))
+    return cmd
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="crop.py",
-        description="Crop a video to a rectangle you draw on a still frame.",
+        description="Crop a video to a rectangle you draw on a still frame. "
+                    "Also grabs a screenshot of a single frame (--screenshot) "
+                    "or concatenates clips into one (--stitch).",
     )
     p.add_argument("video", type=Path, nargs="?",
                    help="path to input video (omit when using --stitch)")
@@ -354,6 +438,15 @@ def build_parser() -> argparse.ArgumentParser:
                           help="concat videos into one. Comma-separated paths in order, "
                                "or a directory (files joined in alphabetical order). "
                                "Output suffix: _stitched on the first file's name.")
+    stitch_g.add_argument("--reencode", dest="reencode", action="store_true", default=None,
+                          help="force re-encode + normalize (size/fps/codec) when stitching")
+    stitch_g.add_argument("--no-reencode", dest="reencode", action="store_false",
+                          help="force fast stream-copy concat (fails on mismatched inputs)")
+    stitch_g.add_argument("--fps", type=float, default=30.0, metavar="N",
+                          help="target frame rate when re-encoding a stitch (default: 30)")
+    stitch_g.add_argument("--stitch-size", type=parse_size, default=None, metavar="WxH",
+                          help="target size when re-encoding a stitch "
+                               "(default: largest input, clips letterboxed to fit)")
 
     frame_g = p.add_argument_group("frame selection")
     fx = frame_g.add_mutually_exclusive_group()
@@ -363,6 +456,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="preview frame by index")
     fx.add_argument("--percent", type=float, metavar="P",
                     help="preview frame at P%% of duration (0-100)")
+
+    shot_g = p.add_argument_group("screenshot")
+    shot_g.add_argument("--screenshot", action="store_true",
+                        help="save a frame as an image and exit, no cropping. With a "
+                             "frame selector (-t/--frame/--percent) or -o, saves that "
+                             "single frame (default: <video>_<tag>.png beside the source; "
+                             "format from the -o extension, default .png). With no "
+                             "selector and no -o, extracts frames to <video>_frames/ at "
+                             "the --every interval. Honors --dry-run.")
+    shot_g.add_argument("--every", type=parse_every, default=1.0, metavar="SECONDS",
+                        help="when extracting to <video>_frames/, sample one frame every "
+                             "N seconds (default: 1), or pass 'all' for every frame.")
 
     out_g = p.add_argument_group("output")
     out_g.add_argument("-o", "--output", type=Path, metavar="PATH",
@@ -433,6 +538,40 @@ def run_stitch(args):
     else:
         out_path = first.with_name(f"{first.stem}_stitched{first.suffix}")
 
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None and "ffmpeg" in args.ffmpeg:
+        cand = args.ffmpeg.replace("ffmpeg", "ffprobe")
+        ffprobe = cand if Path(cand).is_file() else None
+
+    # Decide between fast stream-copy and re-encode. Auto: copy only when inputs
+    # are uniform; otherwise re-encode (copy produces broken timestamps / freezes).
+    reencode = args.reencode
+    if reencode is None:
+        if ffprobe is None:
+            reencode = False
+        elif inputs_are_uniform(ffprobe, inputs):
+            reencode = False
+        else:
+            reencode = True
+            print("Inputs differ in size/fps/codec; re-encoding to normalize "
+                  "(use --no-reencode to force fast copy).", file=sys.stderr)
+
+    if reencode:
+        if args.stitch_size is not None:
+            args.stitch_size = (args.stitch_size[0] - args.stitch_size[0] % 2,
+                                args.stitch_size[1] - args.stitch_size[1] % 2)
+        else:
+            args.stitch_size = stitch_target_size(ffprobe, inputs)
+        cmd = build_stitch_filter_cmd(args, inputs, out_path)
+        print("Running:", " ".join(cmd))
+        if args.dry_run:
+            return
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            sys.exit("ffmpeg failed during re-encode stitch.")
+        print(f"Wrote {out_path}")
+        return
+
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
         list_file = Path(f.name)
         for inp in inputs:
@@ -447,13 +586,110 @@ def run_stitch(args):
         result = subprocess.run(cmd)
         if result.returncode != 0:
             sys.exit("ffmpeg failed. Inputs may have mismatched codecs; "
-                     "try re-encoding them to a common format first.")
+                     "retry with --reencode to normalize them.")
         print(f"Wrote {out_path}")
     finally:
         try:
             list_file.unlink()
         except OSError:
             pass
+
+
+def stitch_target_size(ffprobe: str | None, inputs: list[Path]) -> tuple[int, int]:
+    """Largest width/height across inputs, rounded to even. Falls back to 1280x720."""
+    max_w = max_h = 0
+    if ffprobe is not None:
+        for f in inputs:
+            sig = probe_signature(ffprobe, f)
+            if sig is None:
+                continue
+            try:
+                w, h = int(sig[1]), int(sig[2])
+            except (IndexError, ValueError):
+                continue
+            max_w, max_h = max(max_w, w), max(max_h, h)
+    if max_w <= 0 or max_h <= 0:
+        return 1280, 720
+    return max_w - max_w % 2, max_h - max_h % 2
+
+
+def run_screenshot(args):
+    # Bare --screenshot with no -o and no frame selector: extract frames at --every.
+    no_selector = args.time is None and args.frame is None and args.percent is None
+    if args.output is None and no_selector:
+        run_extract_frames(args)
+        return
+
+    frame = get_frame(args.video, args.time, args.frame, args.percent)
+
+    if args.output is not None:
+        out_path = args.output
+    else:
+        if args.frame is not None:
+            tag = f"frame{args.frame}"
+        elif args.time is not None:
+            tag = f"{args.time:g}s"
+        elif args.percent is not None:
+            tag = f"{args.percent:g}pct"
+        else:
+            tag = "mid"
+        out_path = args.video.with_name(f"{args.video.stem}_{tag}.png")
+
+    if out_path.suffix == "":
+        out_path = out_path.with_suffix(".png")
+
+    print(f"Writing {out_path}")
+    if args.dry_run:
+        return
+    if not cv2.imwrite(str(out_path), frame):
+        sys.exit(f"Could not write image (unsupported format?): {out_path}")
+    print(f"Wrote {out_path}")
+
+
+def run_extract_frames(args):
+    out_dir = args.video.with_name(f"{args.video.stem}_frames")
+    cap = cv2.VideoCapture(str(args.video))
+    if not cap.isOpened():
+        sys.exit(f"Could not open video: {args.video}")
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0
+
+    # args.every is None => all frames; otherwise an interval in seconds.
+    if args.every is None:
+        step = 1
+        desc = "every frame"
+    else:
+        if fps <= 0:
+            cap.release()
+            sys.exit("Could not read frame rate; pass --every all to dump every frame.")
+        step = max(1, round(fps * args.every))
+        desc = f"one frame every {args.every:g}s (~{step} frames apart)"
+
+    width = max(6, len(str(total)))
+    print(f"Extracting {desc} to {out_dir}/")
+    if args.dry_run:
+        cap.release()
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    i = saved = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if i % step == 0:
+            path = out_dir / f"frame_{i:0{width}d}.png"
+            if not cv2.imwrite(str(path), frame):
+                cap.release()
+                sys.exit(f"Could not write image: {path}")
+            saved += 1
+            if saved % 50 == 0:
+                print(f"  {saved} frames...", flush=True)
+        i += 1
+    cap.release()
+    if saved == 0:
+        sys.exit(f"No frames decoded from {args.video}")
+    print(f"Wrote {saved} frames to {out_dir}/")
 
 
 def main():
@@ -479,6 +715,10 @@ def main():
 
     if not args.video.is_file():
         sys.exit(f"File not found: {args.video}")
+
+    if args.screenshot:
+        run_screenshot(args)
+        return
 
     aspect = args.aspect
     if args.square:

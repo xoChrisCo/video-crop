@@ -66,6 +66,12 @@ Override with `-o/--output PATH` or change the suffix with `--suffix STR`.
 
 Default: middle of the video.
 
+### Screenshot
+| Flag | Description |
+| ---- | ----------- |
+| `--screenshot` | Save a frame as an image and exit (no cropping). With a frame selector (`-t`/`--frame`/`--percent`) or `-o`, saves that single frame — defaults to `<video>_<tag>.png` beside the source, where `<tag>` reflects the frame selection (format from the `-o` extension, default `.png`). With **no selector and no `-o`**, extracts frames to `<video>_frames/` (`frame_000000.png`, …) at the `--every` interval. Respects `-o` and `--dry-run`. |
+| `--every SECONDS` | When extracting to `<video>_frames/`, sample one frame every N seconds (default: `1`), or pass `all` for every frame. |
+
 ### Output
 | Flag | Description |
 | ---- | ----------- |
@@ -102,7 +108,12 @@ Default: middle of the video.
 ### Stitch
 | Flag | Description |
 | ---- | ----------- |
-| `--stitch LIST_OR_DIR` | Concat videos end-to-end. Comma-separated paths in order, or a directory (joined alphabetically). Output is `<first>_stitched.<ext>`. Uses `-c copy`, so inputs must share codec/params — re-encode them to a common format first if ffmpeg complains. |
+| `--stitch LIST_OR_DIR` | Concat videos end-to-end. Comma-separated paths in order, or a directory (joined alphabetically). Output is `<first>_stitched.<ext>`. |
+| `--reencode` / `--no-reencode` | Force re-encode (normalize size/fps/codec) or force fast stream-copy. Default: auto — copy when inputs are uniform, re-encode otherwise. |
+| `--fps N` | Target frame rate when re-encoding (default: 30). |
+| `--stitch-size WxH` | Target size when re-encoding (default: largest input; smaller clips are letterboxed to fit). |
+
+By default stitch probes the inputs with `ffprobe`. If they share codec, resolution, and timebase it stream-copies (instant, lossless). If they differ — different resolutions, frame rates, or variable-frame-rate recordings — a plain `-c copy` concat plays only the first clip and then freezes on its last frame, so the tool automatically re-encodes through the concat filter to normalize them. Pass `--no-reencode` to override.
 
 ### UI / behavior
 | Flag | Description |
@@ -124,6 +135,21 @@ uv run python crop.py clip.mp4
 # Pick the frame at 5s
 uv run python crop.py clip.mp4 -t 5
 
+# Grab a screenshot at 1:30 (90s), no cropping
+uv run python crop.py clip.mp4 --screenshot -t 90
+
+# Screenshot to a specific file
+uv run python crop.py clip.mp4 --screenshot still.jpg --percent 25
+
+# Extract one frame per second to clip_frames/
+uv run python crop.py clip.mp4 --screenshot
+
+# One frame every 5 seconds
+uv run python crop.py clip.mp4 --screenshot --every 5
+
+# Every single frame
+uv run python crop.py clip.mp4 --screenshot --every all
+
 # Headless crop to exact coords
 uv run python crop.py clip.mp4 --rect 100:50:640:360 --no-ui
 
@@ -138,6 +164,9 @@ uv run python crop.py --stitch ./clips/
 
 # Stitch specific files in order
 uv run python crop.py --stitch intro.mp4,part1.mp4,outro.mp4 -o final.mp4
+
+# Stitch mismatched clips, normalizing to 1080x1920 at 30fps
+uv run python crop.py --stitch ./clips/ --reencode --stitch-size 1080x1920 --fps 30
 ```
 
 ## Notes
